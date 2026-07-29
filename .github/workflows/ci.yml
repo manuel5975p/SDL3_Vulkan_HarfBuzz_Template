@@ -1,0 +1,178 @@
+# Build-only CI: every runner is headless and has no Vulkan driver, so nothing here launches the
+# demo or renders a frame. Each job configures, builds and runs `ctest`, which is windowless by
+# construction (see tests/CMakeLists.txt).
+#
+# Every job builds the *default* configuration — loose assets, no LTO, no size flags. The embedded
+# asset path needs `#embed` (GCC >= 15 / Clang >= 19) plus `xz`, and the size flags are GNU-only;
+# both are exercised by the release recipes in docs/packaging.md, not here.
+#
+# Audio needs no runner-side package: VKHB_AUDIO is on everywhere and libopus/opusfile/libogg are
+# fetched and built from source with the rest, so every job compiles vkhb_audio and runs test_audio
+# (which mixes without an audio device — no runner has one).
+#
+# Toolchain floor: `std::ranges::contains` (src/render/swapchain.cpp) needs libstdc++ 15, libc++ 19
+# or MSVC 17.6. That is why the Linux jobs pull toolchains from the two upstream apt repos below
+# instead of using the runner image's GCC 13/14 and Clang 16-18, and why Ubuntu's own mingw-w64
+# (GCC 13) is not a viable cross-compile job even though it is the documented release path.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux-${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc-15
+            cxx: g++-15
+          - compiler: clang
+            cc: clang-20
+            cxx: clang++-20
+    steps:
+      - uses: actions/checkout@v4
+
+      # glslc compiles the shaders; the X11/Wayland headers are SDL's build-time dependency only
+      # (it dlopen()s the backends at runtime), but without them SDL configures a video-less build.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build glslc xz-utils \
+            libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev libxfixes-dev \
+            libxss-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev
+
+      # Installed for both compilers on purpose: clang has no standard library of its own here, it
+      # uses the newest libstdc++ on the box, and 24.04 only ships up to 14.
+      - name: Install GCC 15
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get install -y g++-15
+
+      - name: Install Clang 20
+        if: matrix.compiler == 'clang'
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  macos:
+    name: macos-clang
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # Homebrew LLVM rather than Apple Clang: it brings its own recent libc++, which is what the
+      # C++23 library floor above needs. No Vulkan SDK — MoltenVK is a *runtime* dependency, and
+      # cmake/Dependencies.cmake fetches Vulkan-Headers when no SDK is installed.
+      - name: Install build dependencies
+        run: brew install ninja shaderc llvm xz
+
+      - name: Configure
+        run: |
+          llvm="$(brew --prefix llvm)"
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER="$llvm/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$llvm/bin/clang++" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L$llvm/lib/c++ -L$llvm/lib/unwind -lunwind -Wl,-rpath,$llvm/lib/c++"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows-mingw:
+    name: windows-mingw
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-shaderc
+
+      # The MINGW branches in cmake/BuildOptions.cmake apply here exactly as they do when cross
+      # compiling from Linux: -Wa,-mbig-obj, -lstdc++exp, and a fully -static link by default.
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows-msvc:
+    name: windows-${{ matrix.toolset }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolset: msvc
+            cmake_toolset: v143
+          - toolset: clang
+            cmake_toolset: ClangCL
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSYS2 is installed here for exactly one file: glslc.exe. It is a host tool invoked by
+      # add_custom_command, so its ABI has nothing to do with the build below — this just avoids a
+      # ~1 GB Vulkan SDK install for a shader compiler. (The Vulkan *headers* are fetched by
+      # cmake/Dependencies.cmake, and volk loads the ICD at runtime, so no SDK is needed at all.)
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-shaderc
+
+      - name: Put glslc on PATH
+        run: echo "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin" >> $env:GITHUB_PATH
+
+      # The Visual Studio generator locates cl.exe/clang-cl.exe and the Windows SDK itself, so no
+      # vcvars shell is needed. It is multi-config, hence --config/-C rather than CMAKE_BUILD_TYPE.
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -T ${{ matrix.cmake_toolset }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
